@@ -51,6 +51,7 @@ static struct kmem_cache *nova_inode_cachep;
 static struct kmem_cache *nova_range_node_cachep;
 
 /* FIXME: should the following variable be one per NOVA instance? */
+//unsigned int nova_dbgmask = NOVA_DBGMASK_VERBOSE|NOVA_DBGMASK_MMAP4K;
 unsigned int nova_dbgmask = 0;
 
 void nova_error_mng(struct super_block *sb, const char *fmt, ...)

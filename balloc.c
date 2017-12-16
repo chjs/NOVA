@@ -585,7 +585,7 @@ retry:
 	}
 	*blocknr = new_blocknr;
 
-	nova_dbg_verbose("Alloc %lu NVMM blocks 0x%lx\n", ret_blocks, *blocknr);
+	nova_dbg_verbose("[%s] Alloc %lu NVMM blocks 0x%lx\n", __func__, ret_blocks, *blocknr);
 	return ret_blocks / nova_get_numblocks(btype);
 }
 
@@ -599,9 +599,9 @@ inline int nova_new_data_blocks(struct super_block *sb, struct nova_inode *pi,
 	allocated = nova_new_blocks(sb, blocknr, num,
 					pi->i_blk_type, zero, DATA);
 	NOVA_END_TIMING(new_data_blocks_t, alloc_time);
-	nova_dbgv("Inode %llu, start blk %lu, cow %d, "
+	nova_dbgv("[%s] Inode %llu, start blk %lu, cow %d, "
 			"alloc %d data blocks from %lu to %lu\n",
-			pi->nova_ino, start_blk, cow, allocated, *blocknr,
+			__func__, pi->nova_ino, start_blk, cow, allocated, *blocknr,
 			*blocknr + allocated - 1);
 	return allocated;
 }

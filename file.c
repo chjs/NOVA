@@ -126,7 +126,7 @@ static unsigned long nova_get_dirty_range(struct super_block *sb,
 	loff_t dirty_start;
 	loff_t temp = *start;
 
-	nova_dbgv("%s: inode %llu, start %llu, end %llu\n",
+	nova_dbgv("[%s] inode %llu, start %llu, end %llu\n",
 			__func__, pi->nova_ino, *start, end);
 
 	dirty_start = temp;
@@ -197,6 +197,8 @@ int nova_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 	loff_t isize;
 	timing_t fsync_time;
 
+	nova_dbgv("\n\n[%s]\n", __func__);
+
 	NOVA_START_TIMING(fsync_t, fsync_time);
 	if (!mapping_mapped(mapping))
 		goto out;
@@ -225,7 +227,7 @@ int nova_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 	start_blk = start >> PAGE_SHIFT;
 	end_blk = end >> PAGE_SHIFT;
 
-	nova_dbgv("%s: start %llu, end %llu, size %llu, "
+	nova_dbgv("[%s] start %llu, end %llu, size %llu, "
 			" start_blk %lu, end_blk %lu\n",
 			__func__, start, end, isize, start_blk,
 			end_blk);
@@ -239,8 +241,8 @@ int nova_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 
 		nr_flush_bytes = nova_get_dirty_range(sb, pi, si, &start, end);
 
-		nova_dbgv("start %llu, flush bytes %lu\n",
-				start, nr_flush_bytes);
+		nova_dbgv("[%s] start %llu, flush bytes %lu\n",
+				__func__, start, nr_flush_bytes);
 		if (nr_flush_bytes) {
 			nova_copy_to_nvmm(sb, inode, pi, start,
 				nr_flush_bytes, &begin_temp, &end_temp);
@@ -265,6 +267,113 @@ int nova_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 
 out:
 	NOVA_END_TIMING(fsync_t, fsync_time);
+
+	return ret;
+}
+
+int nova_msync(struct file *file, loff_t start, loff_t end, int datasync,
+		struct vm_area_struct *vma)
+{
+	/* Sync from start to end[inclusive] */
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
+	struct nova_inode_info *si = NOVA_I(inode);
+	struct nova_inode_info_header *sih = &si->header;
+	struct super_block *sb = inode->i_sb;
+	struct nova_inode *pi;
+	unsigned long start_blk, end_blk;
+	//u64 end_tail = 0, begin_tail = 0;
+	//u64 begin_temp = 0, end_temp = 0;
+	int ret = 0;
+	//loff_t sync_start, sync_end;
+	loff_t isize;
+	pgoff_t pgoff;
+	timing_t msync_time;
+	u64 mmap_block;
+	void *mmap_addr;
+	unsigned long cache_addr = 0;
+	unsigned long address, offset;
+
+	nova_dbgv("[%s] start=%lld, end=%lld, sync=%d\n",
+			__func__, start, end, datasync);
+
+	NOVA_START_TIMING(fsync_t, msync_time);
+	if (!mapping_mapped(mapping))
+		goto out;
+
+	mutex_lock(&inode->i_mutex);
+
+	/* Check the dirty range */
+	pi = nova_get_inode(sb, inode);
+
+	end += 1; /* end is inclusive. We like our indices normal please! */
+
+	isize = i_size_read(inode);
+
+	if ((unsigned long)end > (unsigned long)isize)
+		end = isize;
+	if (!isize || (start >= end))
+	{
+		nova_dbg_verbose("[%s:%d] : (ERR) isize(%llx), start(%llx),"
+			" end(%llx)\n", __func__, __LINE__, isize, start, end);
+		NOVA_END_TIMING(fsync_t, msync_time);
+		mutex_unlock(&inode->i_mutex);
+		return 0;
+	}
+
+	/*
+	 * 1. flush cache
+	 * 2. update tail pointer
+	 * 3. delete cache tree
+	 * 4. reasign radix tree
+	 */
+
+	nova_get_sync_range(sih, &start, &end);
+	start_blk = start >> PAGE_SHIFT;
+	end_blk = end >> PAGE_SHIFT;
+
+	nova_dbgv("[%s] start %llu, end %llu, size %llu, "
+			" start_blk %lu, end_blk %lu\n",
+			__func__, start, end, isize, start_blk,
+			end_blk);
+
+	while (start < end) {
+		pgoff = start >> PAGE_SHIFT;
+
+		cache_addr = nova_get_cache_addr(sb, si, pgoff);
+		if (cache_addr && nova_check_page_dirty(sb, cache_addr)) {
+			nova_dbgv("[%s] sync\n", __func__);
+			mmap_block = MMAP_ADDR(cache_addr);
+			mmap_addr = nova_get_block(sb, mmap_block);
+			nova_flush_buffer(mmap_addr, PAGE_SIZE, 0);
+			nova_dbgv("[%s] flush buffer=%p\n",
+					__func__, mmap_addr);
+
+			offset = (unsigned long)(pgoff - vma->vm_pgoff);
+			address = vma->vm_start + (offset * PAGE_SIZE);
+			vm_insert_mixed_cow(vma, address, nova_get_pfn(sb, mmap_block), 0);
+			nova_dbgv("[%s] offset=%lu, address=0x%lx, read map\n",
+					__func__, offset, address);
+
+			radix_tree_delete(&sih->cache_tree, pgoff);
+			nova_dbgv("[%s] delete cache tree, pgoff=%lu\n",
+					__func__, pgoff);
+		}
+		start += PAGE_SIZE;
+	}
+
+	nova_update_tail(pi, sih->msync_log_tail);
+
+	/* Free the overlap blocks after the write is committed */
+	ret = nova_reassign_file_tree(sb, pi, sih, sih->msync_log_begin);
+	sih->msync_log_begin = sih->msync_log_tail;
+
+	inode->i_blocks = le64_to_cpu(pi->i_blocks);
+
+	mutex_unlock(&inode->i_mutex);
+
+out:
+	NOVA_END_TIMING(fsync_t, msync_time);
 
 	return ret;
 }
@@ -301,6 +410,7 @@ const struct file_operations nova_dax_file_operations = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl		= nova_compat_ioctl,
 #endif
+	.msync			= nova_msync,
 };
 
 const struct inode_operations nova_file_inode_operations = {

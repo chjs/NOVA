@@ -318,6 +318,8 @@ struct nova_inode_info_header {
 	unsigned long valid_bytes;	/* For thorough GC */
 	u64 last_setattr;		/* Last setattr entry */
 	u64 last_link_change;		/* Last link change entry */
+	__le64	msync_log_begin;	/* Log begin pointer */
+	__le64	msync_log_tail;		/* Log tail pointer */
 };
 
 struct nova_inode_info {
@@ -472,9 +474,12 @@ static inline struct nova_super_block *nova_get_redund_super(struct super_block 
  * nova_memunlock_block() before calling! */
 static inline void *nova_get_block(struct super_block *sb, u64 block)
 {
+	void* result;
 	struct nova_super_block *ps = nova_get_super(sb);
 
-	return block ? ((void *)ps + block) : NULL;
+	result = block ? ((void *)ps + block) : NULL;
+	nova_dbgv("[%s] block(0x%lx) => addr(0x%p)\n", __func__, (unsigned long)block, result);
+	return result;
 }
 
 static inline u64
@@ -590,6 +595,7 @@ static inline int memcpy_to_pmem_nocache(void *dst, const void *src,
 {
 	int ret;
 
+	nova_dbgv("[%s] dst=0x%p, src=0x%p, size=%u\n", __func__, dst, src, size);
 	ret = __copy_from_user_inatomic_nocache(dst, src, size);
 
 	return ret;
@@ -640,6 +646,7 @@ nova_get_write_entry(struct super_block *sb,
 	struct nova_file_write_entry *entry;
 
 	entry = radix_tree_lookup(&sih->tree, blocknr);
+	nova_dbgv("[%s] lookup radix_tree, entry=0x%p\n", __func__, entry);
 
 	return entry;
 }
@@ -656,6 +663,7 @@ static inline unsigned long get_nvmm(struct super_block *sb,
 	struct nova_inode_info_header *sih,
 	struct nova_file_write_entry *data, unsigned long pgoff)
 {
+	unsigned long result;
 	if (data->pgoff > pgoff || (unsigned long)data->pgoff +
 			(unsigned long)data->num_pages <= pgoff) {
 		struct nova_sb_info *sbi = NOVA_SB(sb);
@@ -672,8 +680,10 @@ static inline unsigned long get_nvmm(struct super_block *sb,
 		NOVA_ASSERT(0);
 	}
 
-	return (unsigned long)(data->block >> PAGE_SHIFT) + pgoff
+	result = (unsigned long)(data->block >> PAGE_SHIFT) + pgoff
 		- data->pgoff;
+	nova_dbgv("[%s] result=0x%lx\n", __func__, result);
+	return result;
 }
 
 static inline u64 nova_find_nvmm_block(struct super_block *sb,
@@ -699,7 +709,7 @@ static inline unsigned long nova_get_cache_addr(struct super_block *sb,
 	unsigned long addr;
 
 	addr = (unsigned long)radix_tree_lookup(&sih->cache_tree, blocknr);
-	nova_dbgv("%s: inode %lu, blocknr %lu, addr 0x%lx\n",
+	nova_dbgv("[%s] inode %lu, blocknr %lu, addr 0x%lx\n",
 		__func__, sih->ino, blocknr, addr);
 	return addr;
 }
@@ -918,6 +928,7 @@ ssize_t nova_dax_file_read(struct file *filp, char __user *buf, size_t len,
 ssize_t nova_dax_file_write(struct file *filp, const char __user *buf,
 		size_t len, loff_t *ppos);
 int nova_dax_file_mmap(struct file *file, struct vm_area_struct *vma);
+int nova_test(unsigned long blocknr, char __user *buf);
 
 /* dir.c */
 extern const struct file_operations nova_dir_operations;
@@ -942,6 +953,8 @@ int nova_rebuild_dir_inode_tree(struct super_block *sb,
 extern const struct inode_operations nova_file_inode_operations;
 extern const struct file_operations nova_dax_file_operations;
 int nova_fsync(struct file *file, loff_t start, loff_t end, int datasync);
+int nova_msync(struct file *file, loff_t start, loff_t end, int datasync,
+		struct vm_area_struct *vma);
 
 /* inode.c */
 extern const struct address_space_operations nova_aops_dax;
@@ -991,6 +1004,7 @@ int nova_assign_write_entry(struct super_block *sb,
 	struct nova_inode_info_header *sih,
 	struct nova_file_write_entry *entry,
 	bool free);
+
 
 /* ioctl.c */
 extern long nova_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);

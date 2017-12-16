@@ -266,7 +266,7 @@ static int nova_delete_cache_tree(struct super_block *sb,
 	int deleted = 0;
 	void *ret;
 
-	nova_dbgv("%s: inode %lu, mmap pages %lu, start %lu, last %lu\n",
+	nova_dbgv("[%s] inode %lu, mmap pages %lu, start %lu, last %lu\n",
 			__func__, sih->ino, sih->mmap_pages,
 			start_blocknr, last_blocknr);
 
@@ -526,7 +526,6 @@ int nova_assign_write_entry(struct super_block *sb,
 			}
 		}
 	}
-
 out:
 	NOVA_END_TIMING(assign_t, assign_time);
 
@@ -1083,6 +1082,8 @@ struct inode *nova_new_vfs_inode(enum nova_new_inode_type type,
 	nova_init_header(sb, sih, inode->i_mode);
 	sih->pi_addr = pi_addr;
 	sih->ino = ino;
+	sih->msync_log_begin = 0;
+	sih->msync_log_tail = 0;
 
 	nova_update_inode(inode, pi);
 
@@ -2091,8 +2092,8 @@ u64 nova_append_file_write_entry(struct super_block *sb, struct nova_inode *pi,
 	entry = (struct nova_file_write_entry *)nova_get_block(sb, curr_p);
 	memcpy_to_pmem_nocache(entry, data,
 			sizeof(struct nova_file_write_entry));
-	nova_dbg_verbose("file %lu entry @ 0x%llx: pgoff %llu, num %u, "
-			"block %llu, size %llu\n", inode->i_ino,
+	nova_dbg_verbose("[%s] file %lu entry @ 0x%llx: pgoff %llu, num %u, "
+			"block %llu, size %llu\n", __func__, inode->i_ino,
 			curr_p, entry->pgoff, entry->num_pages,
 			entry->block >> PAGE_SHIFT, entry->size);
 	/* entry->invalid is set to 0 */

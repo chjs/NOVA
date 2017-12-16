@@ -401,7 +401,7 @@ ssize_t nova_cow_file_write(struct file *filp,
 			goto out;
 		}
 
-		nova_dbgv("Write: %p, %lu\n", kmem, copied);
+		nova_dbgv("[%s] Write: %p, %lu\n", __func__, kmem, copied);
 		if (copied > 0) {
 			status = copied;
 			written += copied;
@@ -473,6 +473,8 @@ static ssize_t nova_flush_mmap_to_nvmm(struct super_block *sb,
 	ssize_t written = 0;
 	int status = 0;
 	ssize_t ret;
+
+	nova_dbgv("[%s]\n", __func__);
 
 	while (count) {
 		start_blk = pos >> sb->s_blocksize_bits;
@@ -548,7 +550,7 @@ ssize_t nova_copy_to_nvmm(struct super_block *sb, struct inode *inode,
 	inode->i_ctime = inode->i_mtime = CURRENT_TIME_SEC;
 	time = CURRENT_TIME_SEC.tv_sec;
 
-	nova_dbgv("%s: ino %lu, block %llu, offset %lu, count %lu\n",
+	nova_dbgv("[%s] ino %lu, block %llu, offset %lu, count %lu\n",
 		__func__, inode->i_ino, pos >> sb->s_blocksize_bits,
 		(unsigned long)offset, count);
 
@@ -651,39 +653,86 @@ ssize_t nova_dax_file_write(struct file *filp, const char __user *buf,
 
 static int nova_get_nvmm_pfn(struct super_block *sb, struct nova_inode *pi,
 	struct nova_inode_info *si, u64 nvmm, pgoff_t pgoff,
-	vm_flags_t vm_flags, void **kmem, unsigned long *pfn)
+	vm_flags_t vm_flags, void **kmem, unsigned long *pfn, int iscow,
+	struct inode *inode)
 {
 	struct nova_inode_info_header *sih = &si->header;
 	u64 mmap_block;
 	unsigned long cache_addr = 0;
 	unsigned long blocknr = 0;
+	unsigned int data_bits;
 	void *mmap_addr;
 	void *nvmm_addr;
 	int ret;
+	struct nova_file_write_entry entry_data;
+	u32 time;
+	u64 curr_entry;
+	u64 temp_tail;
+
+	if (iscow) {
+		nova_dbgv("[%s] write access, ", __func__);
+	} else {
+		nova_dbgv("[%s] read access, ", __func__);
+	}
 
 	cache_addr = nova_get_cache_addr(sb, si, pgoff);
 
 	if (cache_addr) {
+		/*
+		 * If there is a cached page, it returns that page.
+		 */
 		mmap_block = MMAP_ADDR(cache_addr);
 		mmap_addr = nova_get_block(sb, mmap_block);
-	} else {
-		ret = nova_new_data_blocks(sb, pi, &blocknr, 1,
-						pgoff, 0, 1);
+		nova_dbgv("cache hit!, mmap_block=0x%lx, mmap_addr=0x%p\n",
+				(unsigned long)mmap_block, mmap_addr);
+	} else if (!iscow) {
+		/*
+		 * If it is a read request, it returns the original page.
+		 */
+		mmap_block = nvmm;
+		mmap_addr = nova_get_block(sb, nvmm);
+		nova_dbgv("cache miss!, mmap_block=0x%lx, mmap_addr=0x%p\n",
+				(unsigned long)mmap_block, mmap_addr);
+	}else {
+		/*
+		 * If it is a write request, it performs copy-on-write.
+		 */
+		time = CURRENT_TIME_SEC.tv_sec;
+
+		if (sih->msync_log_tail == 0)
+			temp_tail = pi->log_tail;
+		else
+			temp_tail = sih->msync_log_tail;
+
+		ret = nova_new_data_blocks(sb, pi, &blocknr, 1, pgoff, 0, 1);
 
 		if (ret <= 0) {
-			nova_err(sb, "%s alloc blocks failed!, %d\n",
+			nova_err(sb, "[%s] alloc blocks failed!, %d\n",
 					__func__, ret);
 			return ret;
 		}
 
 		mmap_block = blocknr << PAGE_SHIFT;
 		mmap_addr = nova_get_block(sb, mmap_block);
+		mmap_block |= MMAP_WRITE_BIT;
+		nova_dbgv("cache miss -> CoW, mmap_block=0x%lx, mmap_addr=0x%p\n",
+				(unsigned long)mmap_block, mmap_addr);
 
 		if (vm_flags & VM_WRITE)
 			mmap_block |= MMAP_WRITE_BIT;
 
-		nova_dbgv("%s: inode %lu, pgoff %lu, mmap block 0x%llx\n",
-			__func__, sih->ino, pgoff, mmap_block);
+		if (nvmm) {
+			/* Copy from the original page to the CoW page */
+			nvmm_addr = nova_get_block(sb, nvmm);
+			memcpy(mmap_addr, nvmm_addr, PAGE_SIZE);
+			nova_dbgv("[%s] copy from nvmm_addr(0x%p) to mmap_addr(0x%p)\n",
+					__func__, nvmm_addr, mmap_addr);
+		} else {
+			memset(mmap_addr, 0, PAGE_SIZE);
+		}
+
+		nova_dbgv("[%s] inode=%lu, pgoff=%lu, mmap_block=0x%lx, blocknr=0x%lx\n",
+			__func__, sih->ino, pgoff, (unsigned long)mmap_block, blocknr);
 
 		ret = radix_tree_insert(&sih->cache_tree, pgoff,
 					(void *)mmap_block);
@@ -693,15 +742,39 @@ static int nova_get_nvmm_pfn(struct super_block *sb, struct nova_inode *pi,
 		}
 
 		sih->mmap_pages++;
-		if (nvmm) {
-			/* Copy from NVMM to dram */
-			nvmm_addr = nova_get_block(sb, nvmm);
-			memcpy(mmap_addr, nvmm_addr, PAGE_SIZE);
-		} else {
-			memset(mmap_addr, 0, PAGE_SIZE);
-		}
-	}
 
+		/* After completing CoW, the corresponding write-entry is created. */
+		entry_data.pgoff = cpu_to_le64(pgoff);
+		entry_data.num_pages = 1;
+		entry_data.invalid_pages = 0;
+		entry_data.block = cpu_to_le64(nova_get_block_off(sb, blocknr, pi->i_blk_type));
+		entry_data.mtime = cpu_to_le32(time);
+		/* Set entry type after set block */
+		nova_set_entry_type((void *)&entry_data, FILE_WRITE);
+		entry_data.size = cpu_to_le64(inode->i_size);
+
+		/* Add the write-entry to the log. */
+		curr_entry = nova_append_file_write_entry(sb, pi, inode,
+							&entry_data, temp_tail);
+		if (curr_entry == 0) {
+			nova_err(sb, "ERROR: append inode entry failed\n");
+			ret = -EINVAL;
+			goto out;
+		}
+
+		/* Record the location of the write-entry added to the log. */
+		if (sih->msync_log_begin == 0)
+			sih->msync_log_begin = curr_entry;
+		sih->msync_log_tail = curr_entry + sizeof(struct nova_file_write_entry);
+
+		nova_memunlock_inode(sb, pi);
+		data_bits = blk_type_to_shift[pi->i_blk_type];
+		le64_add_cpu(&pi->i_blocks,
+				(1 << (data_bits - sb->s_blocksize_bits)));
+		nova_memlock_inode(sb, pi);
+		inode->i_blocks = le64_to_cpu(pi->i_blocks);
+	}
+out:
 	*kmem = mmap_addr;
 	*pfn = nova_get_pfn(sb, mmap_block);
 
@@ -709,7 +782,7 @@ static int nova_get_nvmm_pfn(struct super_block *sb, struct nova_inode *pi,
 }
 
 static int nova_get_mmap_addr(struct inode *inode, struct vm_area_struct *vma,
-	pgoff_t pgoff, int create, void **kmem, unsigned long *pfn)
+	pgoff_t pgoff, int create, void **kmem, unsigned long *pfn, int iscow)
 {
 	struct super_block *sb = inode->i_sb;
 	struct nova_inode_info *si = NOVA_I(inode);
@@ -721,10 +794,12 @@ static int nova_get_mmap_addr(struct inode *inode, struct vm_area_struct *vma,
 
 	pi = nova_get_inode(sb, inode);
 
+	/* get the file block where the page fault occurred. */
 	nvmm = nova_find_nvmm_block(sb, si, NULL, pgoff);
 
+	/* obtain PFN to actually map. */
 	ret = nova_get_nvmm_pfn(sb, pi, si, nvmm, pgoff, vm_flags,
-						kmem, pfn);
+						kmem, pfn, iscow, inode);
 
 	if (vm_flags & VM_WRITE) {
 		if (pgoff < sih->low_dirty)
@@ -749,9 +824,16 @@ static int __nova_dax_file_fault(struct vm_area_struct *vma,
 	unsigned long dax_pfn = 0;
 	int err;
 	int ret = VM_FAULT_SIGBUS;
+	int iscow = vmf->flags & FAULT_FLAG_WRITE;
 
+	nova_dbgv("[%s] flags: vma=0x%lx, vmf=0x%x, pgoff=%lu, write=%d\n",
+			__func__, vma->vm_flags, vmf->flags, vmf->pgoff, iscow);
+
+	sb_start_write(inode->i_sb);
 	mutex_lock(&inode->i_mutex);
+
 	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
 	if (vmf->pgoff >= size) {
 		nova_dbg("[%s:%d] pgoff >= size(SIGBUS). vm_start(0x%lx),"
 			" vm_end(0x%lx), pgoff(0x%lx), VA(%lx), size 0x%lx\n",
@@ -761,7 +843,7 @@ static int __nova_dax_file_fault(struct vm_area_struct *vma,
 	}
 
 	err = nova_get_mmap_addr(inode, vma, vmf->pgoff, 1,
-						&dax_mem, &dax_pfn);
+						&dax_mem, &dax_pfn, iscow);
 	if (unlikely(err)) {
 		nova_dbg("[%s:%d] get_mmap_addr failed. vm_start(0x%lx),"
 			" vm_end(0x%lx), pgoff(0x%lx), VA(%lx)\n",
@@ -770,8 +852,8 @@ static int __nova_dax_file_fault(struct vm_area_struct *vma,
 		goto out;
 	}
 
-	nova_dbgv("%s flags: vma 0x%lx, vmf 0x%x\n",
-			__func__, vma->vm_flags, vmf->flags);
+	nova_dbgv("[%s] flags: dax_mem 0x%p, dax_pfn 0x%lx\n",
+			__func__, dax_mem, dax_pfn);
 
 	nova_dbgv("DAX mmap: inode %lu, vm_start(0x%lx), vm_end(0x%lx), "
 			"pgoff(0x%lx), vma pgoff(0x%lx), "
@@ -787,7 +869,7 @@ static int __nova_dax_file_fault(struct vm_area_struct *vma,
 	err = vm_insert_mixed(vma, (unsigned long)vmf->virtual_address,
 		__pfn_to_pfn_t(dax_pfn, PFN_DEV));
 #else
-	err = vm_insert_mixed(vma, (unsigned long)vmf->virtual_address, dax_pfn);
+	err = vm_insert_mixed_cow(vma, (unsigned long)vmf->virtual_address, dax_pfn, iscow);
 #endif
 
 	if (err == -ENOMEM)
@@ -803,6 +885,7 @@ static int __nova_dax_file_fault(struct vm_area_struct *vma,
 
 out:
 	mutex_unlock(&inode->i_mutex);
+	sb_end_write(inode->i_sb);
 	return ret;
 }
 
